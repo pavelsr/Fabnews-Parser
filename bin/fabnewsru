@@ -8,13 +8,18 @@ use Text::CSV;
 use Getopt::Long;
 use Data::Dumper;
 use feature 'say';
+use MongoDB::MongoClient;
+use Mojo::UserAgent;
+use Geo::IP;
+use utf8;
 
 # ABSTRACT: CLI tool for working with fabnews.ru website data
 
 =head1 SYNOPSIS
 
-    fabnewsru -f <filename.csv>
-    fabnews -e parse_lab http://fabnews.ru/fablabs/item/ufo/ # not implemented yet
+    fabnewsru -t csv -n <filename.csv>
+    fabnewsru -t mongo -n <collection_name> # dump labs into mongo db, fabnewsru database
+    fabnewsru --find-nearest # return nearest cmit
 
     By default (with no options) it will create fabnewsru_<datetime>.csv file with 
 
@@ -64,9 +69,30 @@ sub create_header {
 
 my %opts;
 
-GetOptions ("f=s"   => \$opts{file},    # string
-            "v"  => \$opts{v})    # flag
+GetOptions ("t=s"   => \$opts{type},    # string
+			"n=s"  => \$opts{name},
+			"nearest" => \$opts{nearest},
+            "v"  => \$opts{v}
+            )
 or die("Error in command line arguments\n");
+
+warn Dumper \%opts if ($opts{v});
+
+
+my $cnf_hash = { to_csv => 0, to_mongo => 0 };
+
+my $collection;
+if ($opts{type} eq 'mongo') {
+	$cnf_hash->{to_mongo} = 1;
+	my $client = MongoDB::MongoClient->new(host => 'localhost', port => 27017);
+	my $db = $client->get_database('fabnewsru');
+
+	if ($opts{name}) {
+		$collection = $db->get_collection($opts{collection});
+	} else {
+		$collection = $db->get_collection('cmits');
+	}
+}
 
 
 sub timestamp {
@@ -75,55 +101,137 @@ sub timestamp {
     return $result; # like '17-12-2016_17:54'
 }
 
-my $filename;
-warn "Will output to file: ".$opts{file};
 
-if ($opts{file}) {
-	$filename = $opts{file};
-} else {
-	$filename = 'fabnewsru_'.timestamp();
+sub prettify_rus_hash {
+   	my $hash = shift;
+   	while ( my ($key, $value) = each %$hash )
+	{
+	  utf8::decode($value);
+	  utf8::encode($value);
+	}	
+   	return $hash;
 }
 
-my $csv = Text::CSV->new({ eol => "\n" }) or die "Cannot use CSV: ".Text::CSV->error_diag ();
-open my $fh, ">:encoding(utf8)", $filename or die "$filename: $!";
+my $filename;
+my $csv;
+my $fh; # filehandle
 
-# print header
+if ($opts{type} eq 'file') {
+
+	$cnf_hash->{to_csv} = 1;
+	if ($opts{name}) {
+		$filename = $opts{name};
+	} else {
+		$filename = 'fabnewsru_'.timestamp();
+	}
+
+	warn "Will output to file: ".$filename;
+	$csv = Text::CSV->new({ eol => "\n" }) or die "Cannot use CSV: ".Text::CSV->error_diag ();
+	open $fh, ">:encoding(utf8)", $filename or die "$filename: $!";
+
+}
 
 
-my $fabnews = Fabnewsru::Parser->new;
-my $urls = $fabnews->get_paginated_urls("http://fabnews.ru/fablabs/");  # rerurn arrayref
+if ($opts{type}) {
 
-say "total pages: ".scalar @$urls if ($opts{v});
 
-$csv->print ($fh, create_header());
+	my $fabnews = Fabnewsru::Parser->new;
+	my $urls = $fabnews->get_paginated_urls("http://fabnews.ru/fablabs/");  # rerurn arrayref
 
-for (my $i=0; $i < scalar @$urls; $i++) {   # $i = particular url (needed for verbose output only)
+	say "total pages: ".scalar @$urls if ($opts{v});
 
-	my $url = $urls->[$i];
-	my $labs_at_page = $fabnews->parse_labs_list($url); # return an arrayref containing hashes
-	say $url.", total rows: ".@$labs_at_page;
+	$csv->print ($fh, create_header()) if ($cnf_hash->{to_csv});
 
-	for my $lab (@$labs_at_page) {   # $j = lab item (hash)
-		# $lab->{url} url of lab at fabnews.ru
-		my $lab_more_details = $fabnews->parse_lab($lab->{url});
-		my $lab_data = {};
-		%$lab_data = (%$lab, %$lab_more_details);
-		$lab_data->{longlat} = yandex_geocoder($lab_more_details->{location});  # you can comment it if you don't need geocoding
-		
-		say "name:".$lab_data->{name}.",location:".$lab_data->{location}." (".$lab_data->{longlat}.")" if ($opts{v});
+	for (my $i=0; $i < scalar @$urls; $i++) {   # $i = particular url (needed for verbose output only)
 
-		# delete $lab_data->{urls};
+		my $url = $urls->[$i];
+		my $labs_at_page = $fabnews->parse_labs_list($url); # return an arrayref containing hashes
+		say $url.", total rows: ".@$labs_at_page;
 
-		my $arref = map_hash_to_array_manual($lab_data);
+		for my $lab (@$labs_at_page) {   # $j = lab item (hash)
+			# $lab->{url} url of lab at fabnews.ru
+			my $lab_more_details = $fabnews->parse_lab($lab->{url});
+			my $lab_data = {};
+			%$lab_data = (%$lab, %$lab_more_details);
 
-		for (@$arref) {
-			utf8::decode($_);
+			$lab_data->{longlat} = yandex_geocoder($lab_more_details->{location});  # you can comment it if you don't need geocoding
+			say "name:".$lab_data->{name}.",location:".$lab_data->{location}." (".$lab_data->{longlat}.")" if ($opts{v});
+
+			# convertation of MongoDB geo queries
+			my @tmp = split(' ', $lab_data->{longlat});
+			$tmp[0] = $tmp[0] * 1;
+			$tmp[1] = $tmp[1] * 1;
+			$lab_data->{longlat} = [ $tmp[0], $tmp[1] ];
+			# end of convertation of MongoDB geo queries
+
+			delete $lab_data->{urls};
+
+			#
+			if ($cnf_hash->{to_mongo}) {
+				# prettify_rus_hash($lab_data); #!
+				warn Dumper $lab_data;
+				my $id = $collection->insert($lab_data);
+				warn "mongo:ins:".$id if ($opts{v});
+			}
+
+			if ($cnf_hash->{to_csv}) {
+				my $arref = map_hash_to_array_manual($lab_data);
+				for (@$arref) {
+					utf8::decode($_);
+				}
+				$csv->print ($fh, $arref);
+			}
+
 		}
-
-		$csv->print ($fh, $arref);
 
 	}
 
+	close $fh or die "$filename: $!" if ($cnf_hash->{to_csv});
+
+
 }
 
-close $fh or die "$filename: $!";
+
+
+
+# db.cmits.aggregate([
+#    {
+#      $geoNear: {
+#         near: { type: "Point", coordinates: [ 47.23317 , 39.716848 ] },
+#         distanceField: "dist.calculated",
+#         query: { type: "public" },
+#         includeLocs: "loc",
+#         num: 5,
+#         spherical: true
+#      }
+#    }
+# ])
+
+
+
+if ($opts{nearest}) {
+	# warn 'nearest';
+	my $ua = Mojo::UserAgent->new;
+	my $public_ip = $ua->get('http://ipinfo.io/ip')->res->body;
+	warn "Public IP : ".$public_ip if ($opts{v});
+
+	my $geoipdata = $ua->get('http://geoip.nekudo.com/api/'.$public_ip)->res->json;
+	# my $geoipdata = $ua->get('http://freegeoip.net/json/'.$public_ip)->res->json;
+	warn Dumper $geoipdata if ($opts{v});
+
+	$geoipdata->{location}{longitude} = $geoipdata->{location}{longitude} * 1;
+	$geoipdata->{location}{latitude} = $geoipdata->{location}{latitude} * 1;
+
+	my $client = MongoDB::MongoClient->new(host => 'localhost', port => 27017);
+	my $db = $client->get_database('fabnewsru');
+	my $collection = $db->get_collection('cmits');
+
+	my $loc = [ $geoipdata->{location}{longitude}, $geoipdata->{location}{latitude} ];
+
+	warn Dumper $loc if ($opts{v});
+
+	my @all = $collection->find( { 'longlat' => { '$near' => { '$geometry' => { 'type' => "Point" , 'coordinates' => [ 47.23317, 39.716848 ] }}}} )->all; 
+
+	warn Dumper \@all;
+
+}
