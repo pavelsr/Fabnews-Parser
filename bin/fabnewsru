@@ -44,6 +44,23 @@ sub map_hash_to_array_manual {
 	]
 }
 
+sub create_header {
+	my $a = [ 
+		'name', 
+		'location',  
+		'longlat', 
+		'website', 
+		'business_fields', 
+		'phone',  
+		'email', 
+		'foundation_date',
+		'fabnews_rating',
+		'fabnews_subscribers',
+		'last_post'
+	];
+	return $a;
+}
+
 
 my %opts;
 
@@ -67,7 +84,7 @@ if ($opts{file}) {
 	$filename = 'fabnewsru_'.timestamp();
 }
 
-my $csv = Text::CSV->new() or die "Cannot use CSV: ".Text::CSV->error_diag ();
+my $csv = Text::CSV->new({ eol => "\n" }) or die "Cannot use CSV: ".Text::CSV->error_diag ();
 open my $fh, ">:encoding(utf8)", $filename or die "$filename: $!";
 
 # print header
@@ -77,6 +94,8 @@ my $fabnews = Fabnewsru::Parser->new;
 my $urls = $fabnews->get_paginated_urls("http://fabnews.ru/fablabs/");  # rerurn arrayref
 
 say "total pages: ".scalar @$urls if ($opts{v});
+
+$csv->print ($fh, create_header());
 
 for (my $i=0; $i < scalar @$urls; $i++) {   # $i = particular url (needed for verbose output only)
 
